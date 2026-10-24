@@ -1,0 +1,365 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing v* tag to release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repository-release
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    env:
+      FLUTTER_VERSION: 3.41.5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Resolve Dart packages
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Test
+        run: flutter test
+
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      build_name: ${{ steps.version.outputs.build_name }}
+      build_number: ${{ steps.version.outputs.build_number }}
+      release_notes_file: ${{ steps.release_notes.outputs.file }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Resolve version from pubspec
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          RAW_VERSION="$(sed -n 's/^version:[[:space:]]*//p' pubspec.yaml | tr -d '\r')"
+          TAG_NAME="${RELEASE_TAG#v}"
+
+          if [[ ! "$RAW_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\+([1-9][0-9]*)$ ]]; then
+            echo "::error::pubspec.yaml 版本必须符合 MAJOR.MINOR.PATCH+BUILD"
+            exit 1
+          fi
+          BUILD_NAME="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+          BUILD_NUMBER="${BASH_REMATCH[4]}"
+
+          if [[ "$BUILD_NAME" != "$TAG_NAME" ]]; then
+            echo "::error::Tag 版本 ${TAG_NAME} 与 pubspec.yaml 中的 ${BUILD_NAME} 不一致"
+            exit 1
+          fi
+
+          echo "build_name=$BUILD_NAME" >> "$GITHUB_OUTPUT"
+          echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve release notes
+        id: release_notes
+        shell: bash
+        run: |
+          candidates=(
+            "docs/release-notes/${RELEASE_TAG}.md"
+            "docs/release-notes/${{ steps.version.outputs.build_name }}.md"
+          )
+
+          for candidate in "${candidates[@]}"; do
+            if [[ -f "$candidate" ]]; then
+              echo "file=$candidate" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+
+          echo "::error::缺少更新日志文件，请先创建 docs/release-notes/${RELEASE_TAG}.md"
+          exit 1
+
+  build-android:
+    runs-on: ubuntu-latest
+    needs: [quality, prepare]
+    defaults:
+      run:
+        shell: bash
+    env:
+      FLUTTER_VERSION: 3.41.5
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Restore and verify Android signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          EXPECTED_CERT_SHA256: ${{ secrets.ANDROID_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [[ -n "$KEYSTORE_BASE64" ]] || missing+=(ANDROID_KEYSTORE_BASE64)
+          [[ -n "$KEYSTORE_PASSWORD" ]] || missing+=(ANDROID_KEYSTORE_PASSWORD)
+          [[ -n "$KEY_ALIAS" ]] || missing+=(ANDROID_KEY_ALIAS)
+          [[ -n "$KEY_PASSWORD" ]] || missing+=(ANDROID_KEY_PASSWORD)
+          [[ -n "$EXPECTED_CERT_SHA256" ]] || missing+=(ANDROID_CERT_SHA256)
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::缺少 Android 正式签名 secrets: ${missing[*]}"
+            exit 1
+          fi
+
+          echo "$KEYSTORE_BASE64" | base64 --decode > android/app/daidai-release.jks
+          KEYSTORE_INFO="$(keytool -J-Duser.language=en -J-Duser.country=US -list -v \
+            -keystore android/app/daidai-release.jks \
+            -storepass "$KEYSTORE_PASSWORD")"
+          grep -Fq "Keystore type: JKS" <<< "$KEYSTORE_INFO"
+          keytool -exportcert -rfc \
+            -keystore android/app/daidai-release.jks \
+            -storepass "$KEYSTORE_PASSWORD" \
+            -alias "$KEY_ALIAS" > "$RUNNER_TEMP/android-release.pem"
+
+          CERT_TEXT="$(openssl x509 -in "$RUNNER_TEMP/android-release.pem" -noout -text)"
+          grep -Fq "Public-Key: (4096 bit)" <<< "$CERT_TEXT"
+          grep -Fq "Signature Algorithm: sha384WithRSAEncryption" <<< "$CERT_TEXT"
+          CERT_END_DATE="$(openssl x509 -in "$RUNNER_TEMP/android-release.pem" -noout -enddate | cut -d= -f2-)"
+          if [[ ! "$CERT_END_DATE" =~ ^Dec[[:space:]]+25[[:space:]].*[[:space:]]2053[[:space:]]GMT$ ]]; then
+            echo "::error::Android 签名证书有效期终点不是 2053-12-25"
+            exit 1
+          fi
+          ACTUAL_CERT_SHA256="$(openssl x509 -in "$RUNNER_TEMP/android-release.pem" -noout -fingerprint -sha256 | cut -d= -f2 | tr -d ':[:space:]' | tr '[:lower:]' '[:upper:]')"
+          NORMALIZED_EXPECTED="$(printf '%s' "$EXPECTED_CERT_SHA256" | tr -d ':[:space:]' | tr '[:lower:]' '[:upper:]')"
+          if [[ ! "$NORMALIZED_EXPECTED" =~ ^[0-9A-F]{64}$ || "$ACTUAL_CERT_SHA256" != "$NORMALIZED_EXPECTED" ]]; then
+            echo "::error::JKS 证书与 ANDROID_CERT_SHA256 不一致"
+            exit 1
+          fi
+
+          cat > android/key.properties <<EOF
+          storeFile=daidai-release.jks
+          storePassword=${KEYSTORE_PASSWORD}
+          keyAlias=${KEY_ALIAS}
+          keyPassword=${KEY_PASSWORD}
+          EOF
+
+      - name: Resolve Dart packages
+        run: flutter pub get
+
+      - name: Build Android APK
+        env:
+          BUILD_NAME: ${{ needs.prepare.outputs.build_name }}
+          BUILD_NUMBER: ${{ needs.prepare.outputs.build_number }}
+        run: |
+          set -euo pipefail
+          flutter build apk --release \
+            --build-name "$BUILD_NAME" \
+            --build-number "$BUILD_NUMBER"
+
+          mkdir -p release
+          cp build/app/outputs/flutter-apk/app-release.apk \
+            "release/Dumb-Panel-APP-v${BUILD_NAME}-android.apk"
+
+      - name: Verify signed Android APK
+        env:
+          BUILD_NAME: ${{ needs.prepare.outputs.build_name }}
+          EXPECTED_CERT_SHA256: ${{ secrets.ANDROID_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          APK_PATH="release/Dumb-Panel-APP-v${BUILD_NAME}-android.apk"
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+          if [[ -z "$APKSIGNER" ]]; then
+            echo "::error::Android SDK 中未找到 apksigner"
+            exit 1
+          fi
+          "$APKSIGNER" verify --verbose --print-certs "$APK_PATH"
+          ACTUAL_CERT_SHA256="$("$APKSIGNER" verify --print-certs-pem "$APK_PATH" | openssl x509 -noout -fingerprint -sha256 | cut -d= -f2 | tr -d ':[:space:]' | tr '[:lower:]' '[:upper:]')"
+          NORMALIZED_EXPECTED="$(printf '%s' "$EXPECTED_CERT_SHA256" | tr -d ':[:space:]' | tr '[:lower:]' '[:upper:]')"
+          if [[ "$ACTUAL_CERT_SHA256" != "$NORMALIZED_EXPECTED" ]]; then
+            echo "::error::Android APK 签名证书与 ANDROID_CERT_SHA256 不一致"
+            exit 1
+          fi
+
+      - name: Verify Android package metadata
+        env:
+          VERSION: ${{ needs.prepare.outputs.build_name }}
+          BUILD_NUMBER: ${{ needs.prepare.outputs.build_number }}
+        run: |
+          set -euo pipefail
+          APK_NAME="Dumb-Panel-APP-v${VERSION}-android.apk"
+          APK_PATH="$PWD/release/$APK_NAME"
+
+          AAPT="$(find "$ANDROID_HOME/build-tools" -type f -name aapt | sort -V | tail -n 1)"
+          if [[ -z "$AAPT" ]]; then
+            echo "::error::Android SDK 中缺少 aapt"
+            exit 1
+          fi
+          CURRENT_BADGING="$("$AAPT" dump badging "$APK_PATH")"
+          if [[ ! "$CURRENT_BADGING" =~ package:\ name=\'([^\']+)\'\ versionCode=\'([0-9]+)\'\ versionName=\'([^\']+)\' ]]; then
+            echo "::error::无法读取目标 APK 包信息"
+            exit 1
+          fi
+          APK_PACKAGE="${BASH_REMATCH[1]}"
+          APK_VERSION_CODE="${BASH_REMATCH[2]}"
+          APK_VERSION_NAME="${BASH_REMATCH[3]}"
+          if [[ "$APK_PACKAGE" != "com.daidai.daidai_app" || "$APK_VERSION_NAME" != "$VERSION" || "$APK_VERSION_CODE" != "$BUILD_NUMBER" ]]; then
+            echo "::error::目标 APK 包名或版本与 Release 元数据不一致"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-package
+          path: release/*.apk
+          if-no-files-found: error
+          retention-days: 7
+
+  build-ios:
+    runs-on: macos-latest
+    needs: [quality, prepare]
+    defaults:
+      run:
+        shell: bash
+    env:
+      FLUTTER_VERSION: 3.41.5
+      BUILD_NAME: ${{ needs.prepare.outputs.build_name }}
+      BUILD_NUMBER: ${{ needs.prepare.outputs.build_number }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Show tool versions
+        run: |
+          flutter --version
+          ruby --version
+          pod --version
+
+      - name: Resolve Dart packages
+        run: flutter pub get
+
+      - name: Ensure iOS scaffolding exists
+        run: |
+          if [[ ! -f ios/Podfile ]]; then
+            flutter create --platforms=ios .
+          fi
+
+      - name: Install CocoaPods dependencies
+        run: |
+          cd ios
+          pod install
+
+      - name: Build unsigned IPA
+        run: |
+          set -euo pipefail
+          flutter build ios --release --no-codesign \
+            --build-name "$BUILD_NAME" \
+            --build-number "$BUILD_NUMBER"
+          APP_PATH="build/ios/iphoneos/Runner.app"
+          BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist")"
+          BUNDLE_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Info.plist")"
+          BUNDLE_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP_PATH/Info.plist")"
+          if [[ "$BUNDLE_ID" != "com.daidai.daidaiApp" || "$BUNDLE_VERSION" != "$BUILD_NAME" || "$BUNDLE_BUILD" != "$BUILD_NUMBER" ]]; then
+            echo "::error::iOS 应用包的 Bundle ID 或版本不一致"
+            exit 1
+          fi
+          mkdir -p build/ios/ipa Payload
+          cp -R "$APP_PATH" Payload/
+          ditto -c -k --sequesterRsrc --keepParent Payload \
+            "build/ios/ipa/Dumb-Panel-APP-v${BUILD_NAME}-unsigned.ipa"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-package
+          path: build/ios/ipa/*.ipa
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    runs-on: ubuntu-latest
+    needs:
+      - prepare
+      - build-android
+      - build-ios
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-package
+          path: release
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-package
+          path: release
+
+      - name: Create Or Update Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          NOTES_FILE="${{ needs.prepare.outputs.release_notes_file }}"
+          mapfile -t APK_FILES < <(find release -maxdepth 1 -type f -name '*.apk')
+          mapfile -t IPA_FILES < <(find release -maxdepth 1 -type f -name '*.ipa')
+          if (( ${#APK_FILES[@]} != 1 || ${#IPA_FILES[@]} != 1 )); then
+            echo "::error::Release 资产集合不符合预期"
+            exit 1
+          fi
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" \
+              --title "${RELEASE_TAG}" \
+              --notes-file "$NOTES_FILE" \
+              --draft=false \
+              --prerelease=false
+            gh release upload "${RELEASE_TAG}" release/* --clobber
+          else
+            gh release create "${RELEASE_TAG}" release/* \
+              --title "${RELEASE_TAG}" \
+              --notes-file "$NOTES_FILE"
+          fi
