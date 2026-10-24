@@ -1,5 +1,6 @@
 import 'package:dio/dio.dart';
 import 'package:dio/io.dart';
+import 'package:dio_cookie_manager/dio_cookie_manager.dart';
 import '../network/app_user_agent.dart';
 import '../network/api_endpoints.dart';
 import '../network/dio_client.dart';
@@ -256,9 +257,11 @@ class AuthService {
           validateStatus: (status) => status != null && status < 600,
           headers: AppUserAgent.defaultHeaders,
         ),
-      )..httpClientAdapter = IOHttpClientAdapter(
-          createHttpClient: () => createIosFriendlyHttpClient(),
-        );
+      );
+      dio.httpClientAdapter = IOHttpClientAdapter(
+        createHttpClient: () => createIosFriendlyHttpClient(),
+      );
+      dio.interceptors.add(CookieManager(DioClient.cookieJar));
       final response = await dio.get(
         ApiEndpoints.health,
         options: Options(followRedirects: false),

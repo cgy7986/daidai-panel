@@ -2,6 +2,8 @@ import 'dart:io';
 
 import 'package:dio/dio.dart';
 import 'package:dio/io.dart';
+import 'package:cookie_jar/cookie_jar.dart';
+import 'package:dio_cookie_manager/dio_cookie_manager.dart';
 import 'package:flutter/foundation.dart';
 import 'package:logger/logger.dart';
 import 'app_user_agent.dart';
@@ -13,6 +15,10 @@ class DioClient {
   static DioClient? _instance;
   late final Dio dio;
   String _baseUrl = '';
+
+  /// 全局 Cookie 存储：让 App 像浏览器一样在请求间保留/回传 Cookie。
+  /// 反向代理（如阿里云 ESA 的 acw_tc 反爬 Cookie）在缺少 Cookie 时可能拦截 POST。
+  static final CookieJar cookieJar = CookieJar();
 
   DioClient._() {
     dio = Dio(
@@ -33,6 +39,9 @@ class DioClient {
     dio.httpClientAdapter = IOHttpClientAdapter(
       createHttpClient: () => createIosFriendlyHttpClient(),
     );
+
+    // 像浏览器一样保存并回传 Cookie（兼容反代/CDN 的反爬 Cookie）。
+    dio.interceptors.add(CookieManager(cookieJar));
 
     if (kDebugMode) {
       dio.interceptors.add(
@@ -61,16 +70,21 @@ class DioClient {
     dio.options.headers.addAll(AppUserAgent.defaultHeaders);
   }
 
-  Dio get rawDio => Dio(
-    BaseOptions(
-      baseUrl: _baseUrl,
-      connectTimeout: const Duration(seconds: 10),
-      receiveTimeout: const Duration(seconds: 10),
-      validateStatus: (status) =>
-          status != null && status >= 200 && status < 300,
-      headers: {'Accept': 'application/json', ...AppUserAgent.defaultHeaders},
-    ),
-  )..httpClientAdapter = IOHttpClientAdapter(
+  Dio get rawDio {
+    final d = Dio(
+      BaseOptions(
+        baseUrl: _baseUrl,
+        connectTimeout: const Duration(seconds: 10),
+        receiveTimeout: const Duration(seconds: 10),
+        validateStatus: (status) =>
+            status != null && status >= 200 && status < 300,
+        headers: {'Accept': 'application/json', ...AppUserAgent.defaultHeaders},
+      ),
+    );
+    d.httpClientAdapter = IOHttpClientAdapter(
       createHttpClient: () => createIosFriendlyHttpClient(),
     );
+    d.interceptors.add(CookieManager(cookieJar));
+    return d;
+  }
 }

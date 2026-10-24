@@ -18,6 +18,9 @@ dependencies:
   # 网络请求
   dio: ^5.7.0
   http: ^1.2.2
+  # 让 App 像浏览器一样保存/回传 Cookie，兼容阿里云 ESA 等会下发反爬 Cookie 的反向代理/CDN
+  dio_cookie_manager: ^3.1.1
+  cookie_jar: ^4.0.8
 
   # 路由
   go_router: ^14.8.1
