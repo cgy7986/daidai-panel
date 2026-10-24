@@ -56,7 +56,7 @@ Future<ConnectionTask<Socket>> _ipv4PreferredConnectionFactory(
   for (final address in addresses) {
     ConnectionTask<Socket> task;
     try {
-      task = Socket.startConnect(address, port);
+      task = await Socket.startConnect(address, port);
     } catch (_) {
       pending -= 1;
       if (pending == 0 && !completer.isCompleted) {
