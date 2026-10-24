@@ -219,21 +219,30 @@ class AuthService {
       return const ServerHealthCheckResult.failure('服务器地址格式无效');
     }
 
+    // 先按用户填写的协议探测，失败再自动尝试另一协议（http<->https），
+    // 兼容「明文 http 反代/内网穿透」与「公网强制 https」两种部署。
     final first = await _probeHealth(serverUrl);
     if (first.reachable) {
-      return first;
+      return ServerHealthCheckResult.success(serverUrl);
     }
 
-    // 公网域名默认按 https 探测；若连接层失败，自动回落 http，兼容明文反代/内网穿透。
-    if (uri.scheme == 'https') {
-      final httpUrl = serverUrl.replaceFirst(RegExp(r'^https://'), 'http://');
-      final second = await _probeHealth(httpUrl);
+    final alternateUrl = _alternateProtocolUrl(serverUrl);
+    if (alternateUrl != null) {
+      final second = await _probeHealth(alternateUrl);
       if (second.reachable) {
-        return ServerHealthCheckResult.success(httpUrl);
+        return ServerHealthCheckResult.success(alternateUrl);
       }
     }
 
     return first;
+  }
+
+  String? _alternateProtocolUrl(String url) {
+    final uri = Uri.tryParse(url);
+    if (uri == null || uri.host.isEmpty) return null;
+    if (uri.scheme == 'https') return uri.replace(scheme: 'http').toString();
+    if (uri.scheme == 'http') return uri.replace(scheme: 'https').toString();
+    return null;
   }
 
   Future<ServerHealthCheckResult> _probeHealth(String serverUrl) async {
