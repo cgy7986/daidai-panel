@@ -315,8 +315,9 @@ class AuthService {
           '服务器健康检查返回 HTTP ${error.response!.statusCode}',
         );
       }
-      return const ServerHealthCheckResult.failure(
-        '无法建立连接，请检查 HTTPS 反向代理、端口和网络配置',
+      // 把底层真实错误带出来，便于直接定位（超时 / 拒绝连接 / DNS / 证书等）。
+      return ServerHealthCheckResult.failure(
+        '无法建立连接【${error.type}】${error.message ?? error.error ?? '未知原因'}',
       );
     } catch (_) {
       return const ServerHealthCheckResult.failure('服务器连接检查失败');
