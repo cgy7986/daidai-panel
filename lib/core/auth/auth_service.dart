@@ -262,6 +262,7 @@ class AuthService {
         createHttpClient: () => createIosFriendlyHttpClient(),
       );
       dio.interceptors.add(CookieManager(DioClient.cookieJar));
+      dio.interceptors.add(BrowserLikeHeadersInterceptor());
       final response = await dio.get(
         ApiEndpoints.health,
         options: Options(followRedirects: false),
