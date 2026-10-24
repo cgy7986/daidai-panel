@@ -23,11 +23,10 @@ class AppUserAgent {
     'X-Client-Type': 'app',
     'X-Client-Platform': _asciiHeaderValue(_platform),
     'X-Client-Version': _asciiHeaderValue(versionLabel),
-    if (_deviceModel.isNotEmpty)
-      'X-Device-Model': _asciiHeaderValue(_deviceModel),
-    if (_deviceName.isNotEmpty)
-      'X-Device-Name': _asciiHeaderValue(_deviceName),
-    if (_osVersion.isNotEmpty) 'X-OS-Version': _asciiHeaderValue(_osVersion),
+    // 注意：这里不再发送 X-Device-Model / X-Device-Name / X-OS-Version。
+    // 设备名（尤其是中文设备名）曾因 HTTP 头不允许非 ASCII 导致请求发不出去；
+    // 且部分 CDN/WAF/源站会拒收这类自定义头并直接返回 400。
+    // 这些头仅用于诊断，移除不影响任何功能，同时彻底消除该风险。
   };
 
   /// HTTP 头字段值必须是 ASCII（可见字符 0x20-0x7E）。
