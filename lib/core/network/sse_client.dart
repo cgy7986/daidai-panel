@@ -57,7 +57,7 @@ class SseClient with WidgetsBindingObserver {
   }) : _onAuthFailedForEpoch = onAuthFailedForEpoch,
        // 默认使用 IPv4 优先的 HttpClient，规避 iOS 在双栈域名下卡死在 IPv6 的问题。
        _clientFactory =
-           clientFactory ?? () => IOClient(createIosFriendlyHttpClient()),
+           clientFactory ?? (() => IOClient(createIosFriendlyHttpClient())),
        _refreshToken =
            refreshToken ??
            ((epoch) async {
