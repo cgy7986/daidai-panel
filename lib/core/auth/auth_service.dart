@@ -268,15 +268,25 @@ class AuthService {
       if (response.statusCode == 200 && healthy) {
         return const ServerHealthCheckResult.success();
       }
-      if (response.statusCode == 200) {
-        return const ServerHealthCheckResult.failure(
-          '服务器健康检查返回了非面板响应，请确认域名反向代理指向 Daidai Panel',
+      // 502/503 说明反代可达但后端面板不可用，这属于真正的“连不上面板”，单独提示。
+      final statusCode = response.statusCode;
+      if (statusCode == 502 || statusCode == 503) {
+        return ServerHealthCheckResult.failure(
+          '反向代理返回 $statusCode，说明反代可达但面板服务未启动或端口不正确',
         );
       }
-      return ServerHealthCheckResult.failure(
-        '服务器健康检查返回 HTTP ${response.statusCode ?? '未知状态'}',
-      );
+      // 只要拿到了 HTTP 响应，就说明这个地址确实有服务在应答（面板/反代可达）。
+      // 不再强制要求 /api/v1/health 返回 {status:'ok'}，避免旧版面板、反代差异或
+      // 路径不存在（404）时“其实能连上却被误判成连不上”。
+      if (statusCode != null) {
+        return const ServerHealthCheckResult.success();
+      }
+      return const ServerHealthCheckResult.failure('服务器健康检查无响应');
     } on DioException catch (error) {
+      // 收到了 HTTP 响应（哪怕是 401/404/500）同样说明服务器可达。
+      if (error.response != null) {
+        return const ServerHealthCheckResult.success();
+      }
       final detail = '${error.message ?? ''} ${error.error ?? ''}'.toLowerCase();
       if (detail.contains('certificate') ||
           detail.contains('hostname mismatch')) {
