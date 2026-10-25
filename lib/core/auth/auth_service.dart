@@ -1,7 +1,10 @@
 import 'package:dio/dio.dart';
+import 'package:dio/io.dart';
+import 'package:dio_cookie_manager/dio_cookie_manager.dart';
 import '../network/app_user_agent.dart';
 import '../network/api_endpoints.dart';
 import '../network/dio_client.dart';
+import '../network/ios_friendly_http.dart';
 import '../storage/secure_storage.dart';
 import '../../shared/models/user.dart';
 import 'auth_session_epoch.dart';
@@ -9,14 +12,18 @@ import 'auth_session_epoch.dart';
 class ServerHealthCheckResult {
   final bool reachable;
   final String? errorMessage;
+  /// 实际可达的地址。当原地址（如 https）不可达、自动回落 http 成功后，这里返回 http 地址。
+  final String? effectiveUrl;
 
   const ServerHealthCheckResult._({
     required this.reachable,
     this.errorMessage,
+    this.effectiveUrl,
   });
 
-  const ServerHealthCheckResult.success()
-    : this._(reachable: true);
+  const ServerHealthCheckResult.success([this.effectiveUrl])
+    : reachable = true,
+      errorMessage = null;
 
   const ServerHealthCheckResult.failure(String message)
     : this._(reachable: false, errorMessage: message);
@@ -213,6 +220,33 @@ class AuthService {
       return const ServerHealthCheckResult.failure('服务器地址格式无效');
     }
 
+    // 先按用户填写的协议探测，失败再自动尝试另一协议（http<->https），
+    // 兼容「明文 http 反代/内网穿透」与「公网强制 https」两种部署。
+    final first = await _probeHealth(serverUrl);
+    if (first.reachable) {
+      return ServerHealthCheckResult.success(serverUrl);
+    }
+
+    final alternateUrl = _alternateProtocolUrl(serverUrl);
+    if (alternateUrl != null) {
+      final second = await _probeHealth(alternateUrl);
+      if (second.reachable) {
+        return ServerHealthCheckResult.success(alternateUrl);
+      }
+    }
+
+    return first;
+  }
+
+  String? _alternateProtocolUrl(String url) {
+    final uri = Uri.tryParse(url);
+    if (uri == null || uri.host.isEmpty) return null;
+    if (uri.scheme == 'https') return uri.replace(scheme: 'http').toString();
+    if (uri.scheme == 'http') return uri.replace(scheme: 'https').toString();
+    return null;
+  }
+
+  Future<ServerHealthCheckResult> _probeHealth(String serverUrl) async {
     try {
       final dio = Dio(
         BaseOptions(
@@ -224,6 +258,11 @@ class AuthService {
           headers: AppUserAgent.defaultHeaders,
         ),
       );
+      dio.httpClientAdapter = IOHttpClientAdapter(
+        createHttpClient: () => createIosFriendlyHttpClient(),
+      );
+      dio.interceptors.add(CookieManager(DioClient.cookieJar));
+      dio.interceptors.add(BrowserLikeHeadersInterceptor());
       final response = await dio.get(
         ApiEndpoints.health,
         options: Options(followRedirects: false),
@@ -233,15 +272,25 @@ class AuthService {
       if (response.statusCode == 200 && healthy) {
         return const ServerHealthCheckResult.success();
       }
-      if (response.statusCode == 200) {
-        return const ServerHealthCheckResult.failure(
-          '服务器健康检查返回了非面板响应，请确认域名反向代理指向 Daidai Panel',
+      // 502/503 说明反代可达但后端面板不可用，这属于真正的“连不上面板”，单独提示。
+      final statusCode = response.statusCode;
+      if (statusCode == 502 || statusCode == 503) {
+        return ServerHealthCheckResult.failure(
+          '反向代理返回 $statusCode，说明反代可达但面板服务未启动或端口不正确',
         );
       }
-      return ServerHealthCheckResult.failure(
-        '服务器健康检查返回 HTTP ${response.statusCode ?? '未知状态'}',
-      );
+      // 只要拿到了 HTTP 响应，就说明这个地址确实有服务在应答（面板/反代可达）。
+      // 不再强制要求 /api/v1/health 返回 {status:'ok'}，避免旧版面板、反代差异或
+      // 路径不存在（404）时“其实能连上却被误判成连不上”。
+      if (statusCode != null) {
+        return const ServerHealthCheckResult.success();
+      }
+      return const ServerHealthCheckResult.failure('服务器健康检查无响应');
     } on DioException catch (error) {
+      // 收到了 HTTP 响应（哪怕是 401/404/500）同样说明服务器可达。
+      if (error.response != null) {
+        return const ServerHealthCheckResult.success();
+      }
       final detail = '${error.message ?? ''} ${error.error ?? ''}'.toLowerCase();
       if (detail.contains('certificate') ||
           detail.contains('hostname mismatch')) {
@@ -270,8 +319,9 @@ class AuthService {
           '服务器健康检查返回 HTTP ${error.response!.statusCode}',
         );
       }
-      return const ServerHealthCheckResult.failure(
-        '无法建立连接，请检查 HTTPS 反向代理、端口和网络配置',
+      // 把底层真实错误带出来，便于直接定位（超时 / 拒绝连接 / DNS / 证书等）。
+      return ServerHealthCheckResult.failure(
+        '无法建立连接【${error.type}】${error.message ?? error.error ?? '未知原因'}',
       );
     } catch (_) {
       return const ServerHealthCheckResult.failure('服务器连接检查失败');

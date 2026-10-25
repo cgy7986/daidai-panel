@@ -1,3 +1,4 @@
+import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -164,13 +165,15 @@ class _LoginPageState extends ConsumerState<LoginPage> {
           return;
         }
 
-        _currentUrl = finalUrl;
+        // 使用实际可达的地址（https 不可达时健康检查可能已回落到 http）。
+        final effectiveUrl = health.effectiveUrl ?? finalUrl;
+        _currentUrl = effectiveUrl;
         final authEpoch = TokenRefreshCoordinator.invalidate();
         await SecureStorage.clearAuthSession(authEpoch: authEpoch);
-        DioClient.instance.setBaseUrl(finalUrl);
-        await SecureStorage.saveServerUrl(finalUrl);
+        DioClient.instance.setBaseUrl(effectiveUrl);
+        await SecureStorage.saveServerUrl(effectiveUrl);
         await SecureStorage.savePanel(
-          PanelConfig(url: finalUrl, name: finalUrl),
+          PanelConfig(url: effectiveUrl, name: effectiveUrl),
         );
         _needsServerUrl = false;
         setState(() => _loadingStage = '正在检查面板初始化状态...');
@@ -211,12 +214,22 @@ class _LoginPageState extends ConsumerState<LoginPage> {
       }
 
       setState(() => _loadingStage = '正在登录...');
-      final result = await auth.login(
-        username: _usernameController.text.trim(),
-        password: _passwordController.text,
-        totpCode: _needsTotp ? _totpController.text.trim() : null,
-        captcha: captcha,
-      );
+      Map<String, dynamic> result;
+      try {
+        result = await auth.login(
+          username: _usernameController.text.trim(),
+          password: _passwordController.text,
+          totpCode: _needsTotp ? _totpController.text.trim() : null,
+          captcha: captcha,
+        );
+      } catch (e) {
+        // 主地址登录失败时（如被 CDN/WAF 拦成 400、连接失败、超时等），
+        // 自动切换到已保存的其他服务器地址重试，实现“主备自动切换”。
+        if (!_shouldTryFallback(e)) rethrow;
+        final fallback = await _tryLoginOnFallbackPanels(captcha: captcha);
+        if (fallback == null) rethrow;
+        result = fallback;
+      }
       if (!mounted) return;
 
       if (result['two_factor_required'] == true) {
@@ -293,6 +306,62 @@ class _LoginPageState extends ConsumerState<LoginPage> {
       }
     });
     DioClient.instance.setBaseUrl(panel.url);
+  }
+
+  /// 判断是否值得换一个服务器地址重试。
+  /// 401/403/422 属于凭据、权限或业务校验问题，换地址没有意义，
+  /// 直接原样抛出，让用户看到真实原因（例如密码错误、需要两步验证）。
+  bool _shouldTryFallback(Object e) {
+    if (e is DioException) {
+      final status = e.response?.statusCode;
+      if (status == 401 || status == 403 || status == 422) return false;
+    }
+    return true;
+  }
+
+  /// 依次尝试已保存的其他服务器地址登录（主备自动切换）。
+  /// 适用于主地址被 CDN/WAF 拦截（如 400）、连接失败或超时的场景。
+  /// 成功返回登录结果，全部失败返回 null。
+  Future<Map<String, dynamic>?> _tryLoginOnFallbackPanels({
+    Map<String, dynamic>? captcha,
+  }) async {
+    final panels = await SecureStorage.getPanels();
+    final current = _currentUrl ?? DioClient.instance.baseUrl;
+    if (panels.isEmpty) return null;
+
+    final username = _usernameController.text.trim();
+    final password = _passwordController.text;
+    final totp = _needsTotp ? _totpController.text.trim() : null;
+
+    for (final panel in panels) {
+      if (panel.url == current) continue;
+      if (!mounted) return null;
+      setState(() => _loadingStage = '正在尝试备用地址…');
+
+      try {
+        final health = await AuthService().checkHealthDetails(panel.url);
+        if (!health.reachable) continue;
+
+        final effectiveUrl = health.effectiveUrl ?? panel.url;
+        if (!mounted) return null;
+
+        final authEpoch = TokenRefreshCoordinator.invalidate();
+        await SecureStorage.clearAuthSession(authEpoch: authEpoch);
+        DioClient.instance.setBaseUrl(effectiveUrl);
+        await SecureStorage.saveServerUrl(effectiveUrl);
+        _currentUrl = effectiveUrl;
+
+        return await ref.read(authProvider.notifier).login(
+          username: username,
+          password: password,
+          totpCode: totp,
+          captcha: captcha,
+        );
+      } catch (_) {
+        continue;
+      }
+    }
+    return null;
   }
 
   @override

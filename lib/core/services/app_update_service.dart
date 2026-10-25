@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
+import 'package:dio/io.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -9,6 +10,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../network/app_user_agent.dart';
+import '../network/ios_friendly_http.dart';
 import '../theme/app_theme.dart';
 import 'android_update_manifest.dart';
 
@@ -140,7 +142,9 @@ class AppUpdateService {
     connectTimeout: const Duration(seconds: 10),
     receiveTimeout: const Duration(seconds: 10),
     validateStatus: (status) => status != null && status < 400,
-  ));
+  ))..httpClientAdapter = IOHttpClientAdapter(
+      createHttpClient: () => createIosFriendlyHttpClient(),
+    );
 
   static const _platform = MethodChannel('com.daidai.panel/app_install');
   static const _autoCheckAtKey = 'app_update_auto_check_at';

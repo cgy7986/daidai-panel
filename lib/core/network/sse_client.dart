@@ -3,8 +3,10 @@ import 'dart:convert';
 
 import 'package:flutter/widgets.dart';
 import 'package:http/http.dart' as http;
+import 'package:http/io_client.dart';
 
 import '../auth/auth_session_epoch.dart';
+import 'ios_friendly_http.dart';
 import '../auth/auth_token_snapshot.dart';
 import '../auth/token_refresh_coordinator.dart';
 import '../storage/secure_storage.dart';
@@ -53,7 +55,9 @@ class SseClient with WidgetsBindingObserver {
     Future<void> Function(int epoch)? refreshToken,
     Future<void> Function(int epoch)? clearAuthSession,
   }) : _onAuthFailedForEpoch = onAuthFailedForEpoch,
-       _clientFactory = clientFactory ?? http.Client.new,
+       // 默认使用 IPv4 优先的 HttpClient，规避 iOS 在双栈域名下卡死在 IPv6 的问题。
+       _clientFactory =
+           clientFactory ?? (() => IOClient(createIosFriendlyHttpClient())),
        _refreshToken =
            refreshToken ??
            ((epoch) async {

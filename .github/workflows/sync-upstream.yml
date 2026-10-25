@@ -1,0 +1,122 @@
+name: Sync Upstream & Build
+
+# 每周五 凌晨 3:00（北京时间 UTC+8）= 每周四 19:00 UTC
+on:
+  schedule:
+    - cron: '0 19 * * 4'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "即使没有上游更新也强制构建一次"
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REPO: https://github.com/tall-1997/daidai-flutter.git
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch upstream --prune --tags
+
+      - name: Detect upstream branch and new commits
+        id: check
+        run: |
+          UP_BRANCH=$(git symbolic-ref --short refs/remotes/upstream/HEAD 2>/dev/null || true)
+          UP_BRANCH=${UP_BRANCH#upstream/}
+          if [ -z "$UP_BRANCH" ]; then
+            if git rev-parse --verify upstream/main >/dev/null 2>&1; then
+              UP_BRANCH=main
+            elif git rev-parse --verify upstream/master >/dev/null 2>&1; then
+              UP_BRANCH=master
+            else
+              UP_BRANCH=main
+            fi
+          fi
+          echo "upstream_branch=$UP_BRANCH" >> "$GITHUB_OUTPUT"
+
+          NEW=$(git rev-list --count HEAD..upstream/$UP_BRANCH)
+          echo "new_commits=$NEW" >> "$GITHUB_OUTPUT"
+          echo "上游分支: $UP_BRANCH，待合入提交数: $NEW"
+
+          UP_SHA=$(git rev-parse upstream/$UP_BRANCH)
+          echo "upstream_sha=$UP_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Sync upstream (合并 / 首次嫁接)
+        if: steps.check.outputs.new_commits != '0'
+        run: |
+          UP=upstream/${{ steps.check.outputs.upstream_branch }}
+
+          if git merge-base "$UP" HEAD >/dev/null 2>&1; then
+            echo "检测到共同祖先，执行正常合并"
+            # -X ours：冲突时优先保留本仓库的修改（即 iOS 登录修复等补丁），
+            # 未冲突的部分正常采用上游更新。
+            if ! git merge --no-edit -X ours "$UP"; then
+              echo "::warning::合并冲突无法自动解决，已回滚，本次不同步，请手动处理"
+              git merge --abort || true
+              exit 1
+            fi
+          else
+            # 本仓库是独立创建的（非 fork），与上游无共同祖先。
+            # 直接 merge 会报 refusing to merge unrelated histories；
+            # 即便强行合并也会因缺少基线而丢失上游改动。
+            # 因此首次改为“嫁接”：以上游为基点，把本地修复作为一次提交叠上去，
+            # 从而建立共同祖先，之后即可正常 3-way 合并。
+            echo "未检测到共同祖先，执行首次嫁接：把本地修复叠加到上游之上"
+            git checkout -B grafted "$UP"
+            git checkout main -- .
+            git add -A
+            git commit -m "chore: 将本地 iOS 修复嫁接到上游历史，建立共同祖先以便后续同步" \
+              || echo "无差异，跳过提交"
+          fi
+
+      - name: Push result
+        if: steps.check.outputs.new_commits != '0'
+        run: |
+          # 首次嫁接会重写历史（以取代原独立历史），必须强制推送才能生效；
+          # 正常合并时强制推送同样安全：本仓库 main 仅由本工作流写入，
+          # 且已在远端保留 backup-main 分支可用于回滚。
+          git push -f origin HEAD:main
+
+      - name: Trigger iOS build
+        if: steps.check.outputs.new_commits != '0' || inputs.force_build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run ios-build.yml \
+            --field package_mode=unsigned \
+            --field export_method=development
+          echo "已触发 iOS Build"
+
+      - name: No upstream updates
+        if: steps.check.outputs.new_commits == '0' && inputs.force_build != 'true'
+        run: |
+          echo "上游(upstream/${{ steps.check.outputs.upstream_branch }}) 没有新提交，跳过同步与构建。"

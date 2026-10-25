@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:dio/dio.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../shared/models/user.dart';
@@ -325,7 +327,26 @@ class AuthNotifier extends StateNotifier<AuthState> {
 
       final statusCode = e.response?.statusCode;
       if (statusCode != null && statusCode >= 400) {
-        return '请求失败 (HTTP $statusCode)，请检查服务器配置';
+        // 把反代/CDN 返回的原始内容也带出来，便于判断是被 WAF/反代拦截
+        // （通常是 HTML 错误页），还是面板自身的错误。
+        final raw = e.response?.data;
+        var snippet = '';
+        if (raw is String) {
+          snippet = raw.replaceAll(RegExp(r'\s+'), ' ').trim();
+        } else if (raw is List<int>) {
+          try {
+            snippet = utf8
+                .decode(raw, allowMalformed: true)
+                .replaceAll(RegExp(r'\s+'), ' ')
+                .trim();
+          } catch (_) {}
+        }
+        if (snippet.length > 240) {
+          snippet = '${snippet.substring(0, 240)}…';
+        }
+        return snippet.isEmpty
+            ? '请求失败 (HTTP $statusCode)，请检查服务器配置'
+            : '请求失败 (HTTP $statusCode)：$snippet';
       }
 
       final detail = '${e.message ?? ''} ${e.error ?? ''}'.toLowerCase();

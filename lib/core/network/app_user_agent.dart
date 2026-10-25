@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/foundation.dart';
 import 'package:package_info_plus/package_info_plus.dart';
@@ -16,15 +18,36 @@ class AppUserAgent {
   static String get value => _userAgent;
 
   static Map<String, String> get defaultHeaders => {
-    'User-Agent': _userAgent,
+    'User-Agent': _asciiHeaderValue(_userAgent),
     'X-Client-App': 'daidai-panel-app',
     'X-Client-Type': 'app',
-    'X-Client-Platform': _platform,
-    'X-Client-Version': versionLabel,
-    if (_deviceModel.isNotEmpty) 'X-Device-Model': _deviceModel,
-    if (_deviceName.isNotEmpty) 'X-Device-Name': _deviceName,
-    if (_osVersion.isNotEmpty) 'X-OS-Version': _osVersion,
+    'X-Client-Platform': _asciiHeaderValue(_platform),
+    'X-Client-Version': _asciiHeaderValue(versionLabel),
+    // 注意：这里不再发送 X-Device-Model / X-Device-Name / X-OS-Version。
+    // 设备名（尤其是中文设备名）曾因 HTTP 头不允许非 ASCII 导致请求发不出去；
+    // 且部分 CDN/WAF/源站会拒收这类自定义头并直接返回 400。
+    // 这些头仅用于诊断，移除不影响任何功能，同时彻底消除该风险。
   };
+
+  /// HTTP 头字段值必须是 ASCII（可见字符 0x20-0x7E）。
+  /// iOS 的设备名常是中文（如「张三的 iPhone」），直接放进 X-Device-Name 等头里会触发
+  /// `FormatException: Invalid HTTP header field value`，导致请求发不出去。
+  /// 这里把非 ASCII 字符按 UTF-8 百分号编码（如「陈」→ %E9%99%88），既保证 ASCII 安全，
+  /// 又可被服务端解码还原，不丢信息。
+  static String _asciiHeaderValue(String value) {
+    final sb = StringBuffer();
+    for (final rune in value.runes) {
+      if (rune >= 0x20 && rune <= 0x7E) {
+        sb.writeCharCode(rune);
+      } else {
+        for (final byte in utf8.encode(String.fromCharCode(rune))) {
+          sb.write('%');
+          sb.write(byte.toRadixString(16).toUpperCase().padLeft(2, '0'));
+        }
+      }
+    }
+    return sb.toString();
+  }
 
   static String get versionLabel =>
       _buildNumber.isEmpty ? _version : '$_version+$_buildNumber';

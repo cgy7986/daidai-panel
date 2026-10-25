@@ -258,15 +258,21 @@ class _ServerConfigPageState extends ConsumerState<ServerConfigPage> {
     }
 
     final authService = AuthService();
-    var ok = await authService.checkHealth(finalUrl);
+    var result = await authService.checkHealthDetails(finalUrl);
+    var ok = result.reachable;
+    var lastError = result.errorMessage;
     if (!mounted) return;
 
     if (!ok) {
       final alternateUrl = _alternateProtocolUrl(finalUrl);
       if (alternateUrl != null && await _confirmPublicHttp(alternateUrl)) {
-        final alternateOk = await authService.checkHealth(alternateUrl);
+        final alternateResult =
+            await authService.checkHealthDetails(alternateUrl);
         if (!mounted) return;
-        if (alternateOk) {
+        if (alternateResult.errorMessage != null) {
+          lastError = alternateResult.errorMessage;
+        }
+        if (alternateResult.reachable) {
           finalUrl = alternateUrl;
           ok = true;
         }
@@ -276,7 +282,9 @@ class _ServerConfigPageState extends ConsumerState<ServerConfigPage> {
     if (!ok) {
       setState(() {
         _checking = false;
-        _error = _buildConnectError(finalUrl);
+        // 优先展示真正的失败原因（超时/DNS/TLS/端口等），
+        // 而不是笼统的“无法连接到服务器”，便于定位。
+        _error = lastError ?? _buildConnectError(finalUrl);
       });
       return;
     }
