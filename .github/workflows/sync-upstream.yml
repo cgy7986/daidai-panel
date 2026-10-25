@@ -111,10 +111,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # 必须显式指定仓库：嫁接后当前分支跟踪的是 upstream，
+          # 否则 gh 会误把 dispatch 发到上游仓库并报 403。
           gh workflow run ios-build.yml \
+            --repo "${{ github.repository }}" \
             --field package_mode=unsigned \
             --field export_method=development
-          echo "已触发 iOS Build"
+          echo "已触发 iOS Build (${{ github.repository }})"
 
       - name: No upstream updates
         if: steps.check.outputs.new_commits == '0' && inputs.force_build != 'true'
