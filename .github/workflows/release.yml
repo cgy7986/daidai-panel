@@ -246,7 +246,7 @@ jobs:
           name: android-package
           path: release/*.apk
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
 
   build-ios:
     runs-on: macos-latest
@@ -313,7 +313,7 @@ jobs:
           name: ios-package
           path: build/ios/ipa/*.ipa
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
 
   release:
     runs-on: ubuntu-latest

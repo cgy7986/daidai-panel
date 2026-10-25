@@ -165,7 +165,7 @@ jobs:
             build/ios/iphoneos/Runner.app.zip
             build/ios/iphoneos/Runner.app.dSYM
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
 
       - name: Upload signed IPA artifact
         if: env.BUILD_MODE == 'signed'
@@ -176,4 +176,4 @@ jobs:
             build/ios/ipa/*.ipa
             build/ios/archive/*.xcarchive
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
